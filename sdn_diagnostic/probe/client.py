@@ -33,14 +33,14 @@ class UDPProbeClient:
         for seq in range(count):
             pkt = ProbePacket(seq_id=seq, packet_type=ProbePacket.TYPE_PING, payload_size=payload_size)
             data = pkt.encode()
-            t_send = time.time()
+            t_send = time.perf_counter()
             
             try:
                 sock.sendto(data, (self.target_host, self.target_port))
                 sent_count += 1
 
                 resp_data, _ = sock.recvfrom(4096)
-                t_recv = time.time()
+                t_recv = time.perf_counter()
                 resp_pkt = ProbePacket.decode(resp_data)
 
                 rtt_ms = (t_recv - t_send) * 1000.0
@@ -99,10 +99,10 @@ class UDPProbeClient:
             "packets_sent": sent_count,
             "packets_received": received_count,
             "packet_loss_pct": round(loss_pct, 2),
-            "min_rtt_ms": round(min_rtt, 2),
-            "max_rtt_ms": round(max_rtt, 2),
-            "avg_rtt_ms": round(avg_rtt, 2),
-            "stddev_rtt_ms": round(stddev_rtt, 2),
-            "jitter_ms": round(jitter_ms, 2),
+            "min_rtt_ms": round(min_rtt, 4),
+            "max_rtt_ms": round(max_rtt, 4),
+            "avg_rtt_ms": round(avg_rtt, 4),
+            "stddev_rtt_ms": round(stddev_rtt, 4),
+            "jitter_ms": round(jitter_ms, 4),
             "packets": packets_detail
         }

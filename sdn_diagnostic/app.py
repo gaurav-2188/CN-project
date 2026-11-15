@@ -1,33 +1,42 @@
 """
-FastAPI Server connecting the Web UI, UDP Probe Client/Server, and SDN Correlator.
-Provides simple 1-click REST endpoints.
+FastAPI Server connecting the Web UI, UDP Probe Client/Server, Dynamic SDN Flow Manager,
+Challenging Scenarios, and Performance Benchmarks (Full Deliverable 1 & 2).
 """
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 import os
 import uvicorn
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Query, Body
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from sdn_diagnostic.probe.server import UDPEchoServer
 from sdn_diagnostic.probe.client import UDPProbeClient
 from sdn_diagnostic.topology.controller import create_sample_sdn_topology
+from sdn_diagnostic.topology.flow_manager import FlowTableManager
 from sdn_diagnostic.analysis.correlator import PathCorrelator
+from sdn_diagnostic.scenarios.fault_injector import ScenarioManager
+from sdn_diagnostic.evaluation.benchmarker import BenchmarkSuite
 
-app = FastAPI(title="SDN Diagnostic Tool")
-
-# Global instances
+# Global Core Instances
 echo_server = UDPEchoServer(host="127.0.0.1", port=9999)
 sdn_topology = create_sample_sdn_topology()
 correlator = PathCorrelator(sdn_topology)
+flow_manager = FlowTableManager()
+scenario_manager = ScenarioManager(sdn_topology, echo_server)
+benchmarker = BenchmarkSuite(echo_server)
 
-# Start echo server automatically
-@app.on_event("startup")
-def startup_event():
+# Setup initial flow rules matching default active path
+flow_manager.install_path_flows(["h1", "s1", "s2", "s4", "h3"])
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Launch low-level UDP echo server
     echo_server.start()
-
-@app.on_event("shutdown")
-def shutdown_event():
+    yield
+    # Shutdown: Cleanly terminate echo server and scenario threads
+    scenario_manager.reset_all()
     echo_server.stop()
+
+app = FastAPI(title="SDN Diagnostic & Dynamic Traffic Manager", lifespan=lifespan)
 
 @app.get("/", response_class=HTMLResponse)
 def get_index():
@@ -37,7 +46,11 @@ def get_index():
 
 @app.get("/api/topology")
 def get_topology():
-    return sdn_topology.serialize()
+    topo_data = sdn_topology.serialize()
+    topo_data["active_path"] = flow_manager.active_path
+    topo_data["flow_tables"] = flow_manager.get_flow_rules()
+    topo_data["active_scenario"] = scenario_manager.active_scenario
+    return topo_data
 
 @app.get("/api/probe")
 def run_probe(
@@ -46,18 +59,18 @@ def run_probe(
     count: int = Query(10),
     preserve_faults: bool = Query(False)
 ):
-    # If not preserving injected test faults, ensure clean baseline
-    if not preserve_faults and echo_server.artificial_delay_ms == 0 and echo_server.artificial_drop_rate == 0:
-        pass
-
     # Run active UDP socket probe
     client = UDPProbeClient(target_host="127.0.0.1", target_port=9999, timeout=0.8)
     probe_results = client.run_probe(count=count, interval_ms=15.0)
 
-    # Correlate with SDN topology paths
-    all_paths = sdn_topology.get_all_paths(src, dst)
-    active_path = all_paths[0] if all_paths else []
-    
+    # Correlate with active SDN topology path
+    active_path = flow_manager.active_path
+    path_metrics = sdn_topology.get_path_metrics(active_path)
+    if not path_metrics.get("is_viable", True):
+        probe_results["packet_loss_pct"] = 100.0
+        probe_results["avg_rtt_ms"] = 0.0
+        probe_results["jitter_ms"] = 0.0
+
     analysis = correlator.analyze_path_correlation(
         src_host=src,
         dst_host=dst,
@@ -67,38 +80,87 @@ def run_probe(
 
     return {
         "probe": probe_results,
-        "analysis": analysis
+        "analysis": analysis,
+        "active_path": active_path
     }
 
+# ----------------- Dynamic SDN Functionality (D2: 6 Marks) -----------------
+
+@app.post("/api/sdn/reroute")
+def trigger_dynamic_reroute(target_path: list = Body(None)):
+    """Dynamically updates OpenFlow flow tables along chosen or optimal backup path."""
+    if not target_path:
+        # Determine best alternate path automatically
+        all_paths = sdn_topology.get_all_paths("h1", "h3")
+        viable = [p for p in all_paths if p != flow_manager.active_path and sdn_topology.get_path_metrics(p)["is_viable"]]
+        target_path = viable[0] if viable else ["h1", "s1", "s3", "s4", "h3"]
+
+    flow_manager.install_path_flows(target_path)
+    # Recover test server impairments if rerouting avoided the degraded link
+    if "s2" not in target_path:
+        echo_server.artificial_delay_ms = 0.0
+        echo_server.artificial_drop_rate = 0.0
+
+    return {
+        "status": "reroute_applied",
+        "new_active_path": target_path,
+        "flow_rules": flow_manager.get_flow_rules()
+    }
+
+@app.post("/api/sdn/acl/block")
+def block_traffic(host: str = Query("h2")):
+    """Installs dynamic OpenFlow ACL drop rule (Priority 500)."""
+    res = flow_manager.block_host(host)
+    return res
+
+@app.post("/api/sdn/acl/unblock")
+def unblock_traffic(host: str = Query("h2")):
+    """Removes dynamic OpenFlow ACL drop rule."""
+    res = flow_manager.unblock_host(host)
+    return res
+
+@app.get("/api/sdn/flows")
+def get_flow_tables():
+    """Returns all current OpenFlow forwarding and policy rules."""
+    return flow_manager.get_flow_rules()
+
+# ----------------- Challenging Scenarios / Robustness (D2: 4 Marks) -----------------
+
+@app.post("/api/scenario/switch-crash")
+def run_scenario_switch_crash():
+    """Simulates sudden core switch crash on s2."""
+    return scenario_manager.run_core_switch_failure("s2")
+
+@app.post("/api/scenario/bufferbloat")
+def run_scenario_bufferbloat():
+    """Simulates extreme link congestion and queue bloat."""
+    return scenario_manager.run_severe_bufferbloat(latency_ms=85.0, loss_pct=35.0)
+
+@app.post("/api/scenario/reset")
+def reset_scenario():
+    """Restores baseline operating health."""
+    global sdn_topology, correlator
+    scenario_manager.reset_all()
+    flow_manager.unblock_host("h1")
+    flow_manager.unblock_host("h2")
+    flow_manager.install_path_flows(["h1", "s1", "s2", "s4", "h3"])
+    sdn_topology = create_sample_sdn_topology()
+    correlator = PathCorrelator(sdn_topology)
+    scenario_manager.topology = sdn_topology
+    return {"status": "baseline_reset_complete"}
+
+# Backwards compatible endpoints
 @app.post("/api/fault/degrade")
 def inject_degradation():
-    """Simulates 40ms extra delay and 25% packet drop on active link s1-s2."""
-    echo_server.artificial_delay_ms = 40.0
-    echo_server.artificial_drop_rate = 0.25
-    # Mark in topology
-    for link_id in sdn_topology.link_stats:
-        if ("s1" in link_id and "s2" in link_id):
-            sdn_topology.set_link_status(link_id, delay_ms=45.0, loss_pct=25.0)
-    return {"status": "degradation_injected", "delay_ms": 40.0, "drop_rate": 0.25}
+    return scenario_manager.run_severe_bufferbloat(latency_ms=40.0, loss_pct=25.0)
 
 @app.post("/api/fault/break")
 def inject_link_break():
-    """Simulates complete link failure on s2-s4 (100% drop)."""
-    echo_server.artificial_drop_rate = 1.0
-    for link_id in sdn_topology.link_stats:
-        if ("s2" in link_id and "s4" in link_id):
-            sdn_topology.set_link_status(link_id, is_failed=True, loss_pct=100.0)
-    return {"status": "link_broken", "link": "s2-s4"}
+    return scenario_manager.run_core_switch_failure("s2")
 
 @app.post("/api/fault/reset")
 def reset_faults():
-    """Restores baseline conditions."""
-    global sdn_topology, correlator
-    echo_server.artificial_delay_ms = 0.0
-    echo_server.artificial_drop_rate = 0.0
-    sdn_topology = create_sample_sdn_topology()
-    correlator = PathCorrelator(sdn_topology)
-    return {"status": "reset_successful"}
+    return reset_scenario()
 
 def main():
     uvicorn.run("sdn_diagnostic.app:app", host="127.0.0.1", port=8000, reload=False)
